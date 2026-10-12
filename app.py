@@ -1,16 +1,16 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
 import os
+import numpy as np
+import pandas as pd
+import streamlit as st
 
-from xgboost import XGBClassifier
 from imblearn.pipeline import Pipeline as ImbPipeline
 from imblearn.combine import SMOTETomek
 
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import VotingClassifier, RandomForestClassifier
-from sklearn.calibration import CalibratedClassifierCV
+from sklearn.ensemble import VotingClassifier, AdaBoostClassifier
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.svm import SVC
 
 # =========================================================
 # CONFIGURAÇÃO DA PÁGINA
@@ -22,7 +22,7 @@ st.set_page_config(
 )
 
 # =========================================================
-# MOTOR DE INTERFERÊNCIA (TREINAMENTO COM CALIBRAÇÃO)
+# MOTOR DE INFERÊNCIA (TREINAMENTO COM LDA + SVM LINEAR + ADABOOST)
 # =========================================================
 @st.cache_resource
 def load_and_train_model():
@@ -78,38 +78,37 @@ def load_and_train_model():
         ('cat', OneHotEncoder(drop='first', handle_unknown='ignore', sparse_output=False), cat_cols)
     ])
 
-    # MODELOS (Hiperparâmetros otimizados para AUC 0.82)
-    clf_xgb = XGBClassifier(
-        n_estimators=1000, 
-        learning_rate=0.005, 
-        max_depth=4, 
-        gamma=5, 
-        reg_lambda=10, 
-        random_state=42
-    )
-
-    clf_rf = RandomForestClassifier(
-        n_estimators=500, 
-        max_depth=10, 
+    # MODELOS DO ENSEMBLE (LDA + SVM Linear + AdaBoost)
+    clf_lda = LinearDiscriminantAnalysis()
+    
+    clf_svm = SVC(
+        kernel='linear', 
+        probability=True, 
         class_weight='balanced', 
         random_state=42
     )
 
-    voting_clf = VotingClassifier(
-        estimators=[('xgb', clf_xgb), ('rf', clf_rf)], 
-        voting='soft'
+    clf_adaboost = AdaBoostClassifier(
+        n_estimators=200,
+        learning_rate=0.05,
+        random_state=42
     )
 
-    # Altere isso:
-    # calibrated_model = CalibratedClassifierCV(estimator=voting_clf, method='sigmoid', cv=3)
-    # model = ImbPipeline([('prep', preprocessor), ('smote', SMOTETomek(random_state=42)), ('clf', calibrated_model)])
+    # VOTING ENSEMBLE (SOFT VOTING)
+    voting_clf = VotingClassifier(
+        estimators=[
+            ('lda', clf_lda),
+            ('svm', clf_svm),
+            ('ada', clf_adaboost)
+        ], 
+        voting='soft',
+        weights=[1.0, 1.2, 1.1]
+    )
 
-    # Para isso (Idêntico ao Colab):
     model = ImbPipeline([
-    ('prep', preprocessor),
-    ('smote', SMOTETomek(random_state=42)),
-    ('clf', voting_clf)
-
+        ('prep', preprocessor),
+        ('smote', SMOTETomek(random_state=42)),
+        ('clf', voting_clf)
     ])
 
     model.fit(X, y)
@@ -124,7 +123,7 @@ model = load_and_train_model()
 st.title("🏥 SSDC - Sistema Inteligente de Triagem de AVC")
 st.markdown("""
 **Protótipo de Suporte à Decisão Clínica.** 
-Este sistema utiliza um modelo de Machine Learning calibrado com SMOTETomek e Voting Classifier (XGBoost + Random Forest).
+Este sistema utiliza um modelo de Machine Learning calibrado com **SMOTETomek** e um **Voting Classifier** composto por **LDA, SVM Linear e AdaBoost**.
 """)
 
 # Layout em Colunas para a Ficha Clínica
@@ -155,57 +154,60 @@ with st.container():
 # =========================================================
 st.divider()
 if st.button("🧠 EXECUTAR TRIAGEM INTELIGENTE", use_container_width=True):
-    # Criar DataFrame de entrada
-    input_dict = {
-        'gender': gender, 'age': age, 'hypertension': 1 if hypertension else 0,
-        'heart_disease': 1 if heart_disease else 0, 'ever_married': married,
-        'work_type': work, 'residence_type': residence,
-        'avg_glucose_level': glucose, 'bmi': bmi, 'smoking_status': smoking
-    }
-    df_predict = pd.DataFrame([input_dict])
-
-    # FEATURE ENGINEERING EM TEMPO REAL
-    df_predict['age_hypertension'] = df_predict['age'] * df_predict['hypertension']
-    df_predict['age_heart_disease'] = df_predict['age'] * df_predict['heart_disease']
-    df_predict['metabolic_syndrome'] = (df_predict['avg_glucose_level'] * df_predict['bmi']) / 100
-    
-    married_val = 1 if married == "Yes" else 0
-    df_predict['age_married'] = df_predict['age'] * married_val
-    
-    df_predict['cvd_risk_score'] = (
-        df_predict['hypertension'] + df_predict['heart_disease'] + 
-        (1 if glucose > 150 else 0) + (1 if bmi > 30 else 0)
-    )
-
-    def cat_age_local(a):
-        if a < 30: return 0
-        if a < 60: return 1
-        if a < 75: return 2
-        return 3
-    df_predict['age_bracket'] = df_predict['age'].apply(cat_age_local)
-    
-    df_predict['lifestyle_risk'] = df_predict['work_type'].apply(
-        lambda x: 1 if x in ['Private', 'Self-employed'] else 0
-    )
-
-    # Substitua o cálculo antigo por este mapeamento percentual direto:
-    prob_real = model.predict_proba(df_predict)[0][1]
-    indice_risco = int(prob_real * 100)  # Mostra a probabilidade real de 0 a 100%
-
-    st.subheader("📊 Avaliação do Sistema SSDC")
-
-    # Definição dos thresholds baseada na clínica médica:
-    if prob_real >= 0.50:  # Acima de 50% de chance teórica é Crítico
-        st.error(f"## NÍVEL DE ALERTA: CRÍTICO ({indice_risco}/100)")
-        st.progress(prob_real)
-        st.markdown("🚨 **ESTADO DE EMERGÊNCIA:** O perfil clínico apresenta altíssima convergência com casos positivos de AVC.")
-        
-    elif prob_real >= 0.25:  # Entre 25% e 49% é Risco Alto em medicina preventiva
-        st.warning(f"## NÍVEL DE ALERTA: ALTO ({indice_risco}/100)")
-        st.progress(prob_real)
-        st.markdown("⚠️ **ATENÇÃO:** Múltiplos fatores de risco detectados. Recomendado acompanhamento médico.")
-        
+    if model is None:
+        st.error("Erro: O modelo não pôde ser treinado. Verifique se 'data_stroke.csv' está no diretório.")
     else:
-        st.success(f"## NÍVEL DE ALERTA: MONITORAMENTO ({indice_risco}/100)")
-        st.progress(prob_real)
-        st.markdown("✅ **RISCO SOB CONTROLE:** No momento, os parâmetros não indicam alerta crítico.")
+        # Criar DataFrame de entrada
+        input_dict = {
+            'gender': gender, 'age': age, 'hypertension': 1 if hypertension else 0,
+            'heart_disease': 1 if heart_disease else 0, 'ever_married': married,
+            'work_type': work, 'residence_type': residence,
+            'avg_glucose_level': glucose, 'bmi': bmi, 'smoking_status': smoking
+        }
+        df_predict = pd.DataFrame([input_dict])
+
+        # FEATURE ENGINEERING EM TEMPO REAL
+        df_predict['age_hypertension'] = df_predict['age'] * df_predict['hypertension']
+        df_predict['age_heart_disease'] = df_predict['age'] * df_predict['heart_disease']
+        df_predict['metabolic_syndrome'] = (df_predict['avg_glucose_level'] * df_predict['bmi']) / 100
+        
+        married_val = 1 if married == "Yes" else 0
+        df_predict['age_married'] = df_predict['age'] * married_val
+        
+        df_predict['cvd_risk_score'] = (
+            df_predict['hypertension'] + df_predict['heart_disease'] + 
+            (1 if glucose > 150 else 0) + (1 if bmi > 30 else 0)
+        )
+
+        def cat_age_local(a):
+            if a < 30: return 0
+            if a < 60: return 1
+            if a < 75: return 2
+            return 3
+        df_predict['age_bracket'] = df_predict['age'].apply(cat_age_local)
+        
+        df_predict['lifestyle_risk'] = df_predict['work_type'].apply(
+            lambda x: 1 if x in ['Private', 'Self-employed'] else 0
+        )
+
+        # PROBABILIDADE REAL
+        prob_real = model.predict_proba(df_predict)[0][1]
+        indice_risco = int(prob_real * 100)
+
+        st.subheader("📊 Avaliação do Sistema SSDC")
+
+        # REGRAS DE DECISÃO CLÍNICA BASEADAS NO LIMIAR DE 35% (RECALL = 90%)
+        if prob_real >= 0.35:
+            st.error(f"## 🚨 ALTO RISCO DE AVC DETECTADO ({indice_risco}% de Risco Calculado)")
+            st.progress(prob_real)
+            st.markdown("""
+            ⚠ **TRIAGEM PRIORITÁRIA:** O perfil biológico do paciente ultrapassa o limiar clínico de alerta ($≥35\%$). 
+            Recomenda-se encaminhamento para exames neurológicos e acompanhamento preventivo de emergência.
+            """)
+        else:
+            st.success(f"## ✅ BAIXO RISCO / MONITORAMENTO REGULAR ({indice_risco}% de Risco Calculado)")
+            st.progress(prob_real)
+            st.markdown("""
+            💚 **RISCO SOB CONTROLE:** Os parâmetros do paciente estão dentro do intervalo seguro ($<35\%$). 
+            Manter acompanhamento de rotina.
+            """)
